@@ -1,19 +1,11 @@
 """
 Pascal VOC dataset
-
-Place VOC2012 dataset in 'VOC2012' directory.
-For training, you will need the augmented labels. Download http://vllab1.ucmerced.edu/~whung/adv-semi-seg/SegmentationClassAug.zip.
-The folder structure should be like:
-VOC2012/JPEGImages
-       /SegmentationClassAug
 """
 import os, pickle
 import tqdm
 import numpy as np
-import settings
 from scipy.ndimage.morphology import binary_erosion
 from scipy.ndimage import label
-from scipy.spatial import ConvexHull
 from PIL import Image
 import torch.utils.data
 
@@ -21,7 +13,7 @@ import torch.utils.data
 class DextrDataset (torch.utils.data.Dataset):
     IGNORE_INDEX = None
 
-    def __init__(self, object_meta_path, transform):
+    def __init__(self, object_meta_path, transform, load_input=True):
         if os.path.exists(object_meta_path):
             obj_meta = pickle.load(open(object_meta_path, 'rb'))
             self.obj_meta_indices = obj_meta['indices']
@@ -33,6 +25,8 @@ class DextrDataset (torch.utils.data.Dataset):
 
         self.transform = transform
 
+        self.load_input = load_input
+
 
     def __len__(self):
         return len(self.obj_meta_indices)
@@ -41,9 +35,6 @@ class DextrDataset (torch.utils.data.Dataset):
         # Get object metadata
         img_i, label_i, region_i = self.obj_meta_indices[item]
         outline = self.obj_meta_outlines[item]
-
-        # Get input image
-        input_pil = self.get_input_image_pil(img_i)
 
         # Get the label mask and select the region
         label_mask = self.get_label_mask(img_i, label_i)
@@ -55,7 +46,12 @@ class DextrDataset (torch.utils.data.Dataset):
         object_mask_u8 = object_mask.astype(np.uint8) * 255
         object_mask_pil = Image.fromarray(object_mask_u8)
 
-        sample = dict(input=input_pil, target_mask=object_mask_pil, target_mask_outline=outline)
+        sample = dict(target_mask=object_mask_pil, target_mask_outline=outline)
+
+        if self.load_input:
+            # Get input image
+            input_pil = self.get_input_image_pil(img_i)
+            sample['input'] = input_pil
 
         if self.transform is not None:
             sample = self.transform(sample)
@@ -136,11 +132,7 @@ class DextrDataset (torch.utils.data.Dataset):
 
     @staticmethod
     def mask_outline(mask):
-        interior = binary_erosion(mask)
-        if interior.sum() < 1:
-            return None
-        else:
-            outline = mask & ~binary_erosion(mask)
-            m_y, m_x = np.where(outline)
-            points = np.stack([m_y, m_x], axis=1)
-            return points
+        outline = mask & ~binary_erosion(mask)
+        m_y, m_x = np.where(outline)
+        points = np.stack([m_y, m_x], axis=1)
+        return points

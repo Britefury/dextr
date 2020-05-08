@@ -14,25 +14,27 @@ import click
 @click.option('--target_size', type=int, default=512)
 @click.option('--padding', type=int, default=10)
 @click.option('--extreme_range', type=int, default=5)
-@click.option('--noise_range', type=float, default=1.0)
+@click.option('--noise_std', type=float, default=1.0)
 @click.option('--blob_sigma', type=float, default=10.0)
 @click.option('--aug_hflip', is_flag=True, default=False)
 @click.option('--aug_rot_range', type=float, default=20.0)
 @click.option('--batch_size', type=int, default=5)
 @click.option('--num_epochs', type=int, default=100)
 @click.option('--iters_per_epoch', type=int, default=1000)
+@click.option('--val_every_n_epochs', type=int, default=25)
 @click.option('--device', type=str, default='cuda:0')
 @click.option('--num_workers', type=int, default=8)
 def train_dextr(out_path, dataset, arch, learning_rate, load_model, pretrained_lr_factor, lr_sched, lr_poly_power,
                 opt_type, sgd_weight_decay,
-                target_size, padding, extreme_range, noise_range, blob_sigma, aug_hflip, aug_rot_range,
-                batch_size, num_epochs, iters_per_epoch, device, num_workers):
+                target_size, padding, extreme_range, noise_std, blob_sigma, aug_hflip, aug_rot_range,
+                batch_size, num_epochs, iters_per_epoch, val_every_n_epochs, device, num_workers):
     settings = locals().copy()
 
     import math
     import itertools
     import time
     import tqdm
+    import numpy as np
     import torch, torch.nn as nn, torch.nn.functional as F
     import torch.utils.data
     from torchvision.transforms import Compose
@@ -48,7 +50,7 @@ def train_dextr(out_path, dataset, arch, learning_rate, load_model, pretrained_l
             target_size_yx=(target_size, target_size),
             padding=padding,
             extreme_range=extreme_range,
-            noise_range=noise_range,
+            noise_std=noise_std,
             blob_sigma=blob_sigma,
             hflip=aug_hflip,
             rot_range=math.radians(aug_rot_range),
@@ -59,22 +61,14 @@ def train_dextr(out_path, dataset, arch, learning_rate, load_model, pretrained_l
     ])
 
     eval_transform = Compose([
-        # dextr_transforms.DextrEvaluationTransform(
-        #     target_size_yx=(target_size, target_size),
-        #     padding=padding,
-        #     extreme_range=extreme_range,
-        #     noise_range=0.0,
-        #     blob_sigma=blob_sigma,
-        # ),
-        dextr_transforms.DextrTrainingTransform(
+        dextr_transforms.DextrFindExtremesTransform(
+            target_size_yx=(target_size, target_size),
+            extreme_range=extreme_range,
+        ),
+        dextr_transforms.DextrGaussBlobsTransform(
             target_size_yx=(target_size, target_size),
             padding=padding,
-            extreme_range=extreme_range,
-            noise_range=noise_range,
             blob_sigma=blob_sigma,
-            hflip=aug_hflip,
-            rot_range=math.radians(aug_rot_range),
-            fix_box_to_extreme=True
         ),
         dextr_transforms.DextrToTensor(),
         dextr_transforms.DextrNormalize(),
@@ -83,6 +77,7 @@ def train_dextr(out_path, dataset, arch, learning_rate, load_model, pretrained_l
     if dataset == 'pascal_voc':
         train_ds = pascal_voc_dataset.PascalVOCDataset('train', train_transform)
         val_ds = pascal_voc_dataset.PascalVOCDataset('val', eval_transform)
+        val_truth_ds = pascal_voc_dataset.PascalVOCDataset('val', None, load_input=False)
     else:
         print('Unknown dataset {}'.format(dataset))
         return
@@ -104,6 +99,7 @@ def train_dextr(out_path, dataset, arch, learning_rate, load_model, pretrained_l
 
     # Load model if path provided
     if load_model is not None:
+        print('Loading snapshot from {}...'.format(load_model))
         snapshot = torch.load(load_model)
         net.load_state_dict(snapshot['model_state'])
         target_size = snapshot['target_size']
@@ -157,8 +153,59 @@ def train_dextr(out_path, dataset, arch, learning_rate, load_model, pretrained_l
 
     train_iter = iter(train_loader)
 
+
+    def validate():
+        val_loss_accum = 0.0
+        val_iou_accum = 0.0
+        n_val_batches = 0
+        n_ious = 0
+        val_i = 0
+        with torch.no_grad():
+            for batch in tqdm.tqdm(val_loader, total=len(val_loader)):
+                input = batch['input'].to(torch_device)
+                target_mask = batch['target_mask'].to(torch_device)
+                crop_yx = batch['crop_yx'].detach().cpu().numpy()
+
+                # Compute class balance
+                target_mask_flat = target_mask.view(len(target_mask), -1)
+                target_balance = target_mask_flat.mean(dim=1)
+                target_balance = target_balance[:, None, None, None]
+                bg_weight = target_balance
+                fg_weight = 1.0 - target_balance
+                weight = bg_weight + (fg_weight - bg_weight) * target_mask
+
+                pred_out = net(input)
+                pred_logits = pred_out['out']
+
+                loss = F.binary_cross_entropy_with_logits(pred_logits, target_mask, weight=weight)
+                val_loss_accum += float(loss)
+
+                pred_prob = F.sigmoid(pred_logits).detach().cpu().numpy()
+
+                for i in range(len(crop_yx)):
+                    true_fg = np.array(val_truth_ds[val_i]['target_mask']) > 127
+                    pred_fg = dextr_transforms.paste_mask_into_image(
+                        true_fg.shape, pred_prob[i, 0, :, :], crop_yx[i]) >= 0.5
+
+                    iou_denom = (pred_fg | true_fg).sum()
+                    if iou_denom > 0.0:
+                        iou = (pred_fg & true_fg).sum() / iou_denom
+
+                        val_iou_accum += iou
+                        n_ious += 1
+
+                    val_i += 1
+
+
+                n_val_batches += 1
+
+        return (val_loss_accum / n_val_batches, val_iou_accum / n_ious)
+
+
+
     print('Training...')
     iter_i = 0
+    validated = False
     for epoch in range(num_epochs):
         t1 = time.time()
 
@@ -196,59 +243,35 @@ def train_dextr(out_path, dataset, arch, learning_rate, load_model, pretrained_l
 
         train_loss_accum /= iters_per_epoch
 
-
-        val_loss_accum = 0.0
-        val_iou_accum = 0.0
-        n_val_batches = 0
-        with torch.no_grad():
-            for batch in tqdm.tqdm(val_loader, total=len(val_loader)):
-                input = batch['input'].to(torch_device)
-                target_mask_cpu = batch['target_mask']
-                target_mask = target_mask_cpu.to(torch_device)
-
-                # Compute class balance
-                target_mask_flat = target_mask.view(len(target_mask), -1)
-                target_balance = target_mask_flat.mean(dim=1)
-                target_balance = target_balance[:, None, None, None]
-                bg_weight = target_balance
-                fg_weight = 1.0 - target_balance
-                weight = bg_weight + (fg_weight - bg_weight) * target_mask
-
-                pred_out = net(input)
-                pred_logits = pred_out['out']
-
-                loss = F.binary_cross_entropy_with_logits(pred_logits, target_mask, weight=weight)
-                val_loss_accum += float(loss)
-
-                pred_logits = pred_logits.detach().cpu().numpy()
-
-                pred_fg = pred_logits > 0.0
-                true_fg = target_mask_cpu.detach().cpu().numpy() > 0.5
-
-                iou = (pred_fg & true_fg).sum() / max((pred_fg | true_fg).sum(), 1.0)
-                val_iou_accum += iou
-                n_val_batches += 1
-
-        val_loss_accum /= n_val_batches
-        val_iou_accum /= n_val_batches
-
+        if (epoch + 1) % val_every_n_epochs == 0:
+            val_loss, val_iou = validate()
+            validated = True
+        else:
+            val_loss = val_iou = None
+            validated = False
 
         t2 = time.time()
 
-        print('Epoch {} took {:.3f}s: loss={:.6f}, VAL loss={:.6f}, mIoU={:.3%}'.format(
-            epoch + 1, t2 - t1, train_loss_accum, val_loss_accum, val_iou_accum))
+        if val_loss is not None:
+            print('Epoch {} took {:.3f}s: loss={:.6f}, VAL loss={:.6f}, mIoU={:.3%}'.format(
+                epoch + 1, t2 - t1, train_loss_accum, val_loss, val_iou))
+        else:
+            print('Epoch {} took {:.3f}s: loss={:.6f}'.format(epoch + 1, t2 - t1, train_loss_accum))
 
 
-    if out_path.strip() != 'none':
-        model_state = {key: value.to('cpu') for key, value in net.state_dict().items()}
-        snapshot = dict(
-            model_state=model_state,
-            target_size=target_size,
-            padding=padding,
-            blob_sigma=blob_sigma,
-        )
-        torch.save(snapshot, out_path)
+        if out_path.strip() != 'none':
+            model_state = {key: value.to('cpu') for key, value in net.state_dict().items()}
+            snapshot = dict(
+                model_state=model_state,
+                target_size=target_size,
+                padding=padding,
+                blob_sigma=blob_sigma,
+            )
+            torch.save(snapshot, out_path)
 
+    if not validated:
+        val_loss, val_iou = validate()
+        print('FINAL: VAL loss={:.6f}, mIoU={:.3%}'.format(val_loss, val_iou))
 
 if __name__ == '__main__':
     train_dextr()

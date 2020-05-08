@@ -29,7 +29,7 @@ def _get_pascal_path(exists=False):
 class PascalVOCDataset (dextr_dataset.DextrDataset):
     IGNORE_INDEX = 255
 
-    def __init__(self, split, transform):
+    def __init__(self, split, transform, load_input=True):
         pascal_path = _get_pascal_path(exists=True)
 
         if split == 'train':
@@ -51,7 +51,7 @@ class PascalVOCDataset (dextr_dataset.DextrDataset):
 
         obj_meta_path = os.path.join(pascal_path, 'dextr_objects_{}.pkl'.format(split))
 
-        super(PascalVOCDataset, self).__init__(obj_meta_path, transform)
+        super(PascalVOCDataset, self).__init__(obj_meta_path, transform, load_input=load_input)
 
 
     @property
