@@ -1,9 +1,9 @@
 import click
 
 @click.command()
-@click.argument('out_path', type=str)
+@click.argument('job_name', type=str)
 @click.option('--dataset', type=click.Choice(['pascal_voc']), default='pascal_voc')
-@click.option('--arch', type=click.Choice(['deeplab3', 'denseunet161', 'resunet50', 'resunet101']), default='deeplab3')
+@click.option('--arch', type=click.Choice(['deeplab3', 'denseunet161', 'resunet50', 'resunet101']), default='resunet50')
 @click.option('--load_model', type=click.Path(readable=True))
 @click.option('--learning_rate', type=float, default=0.1)
 @click.option('--pretrained_lr_factor', type=float, default=0.1)
@@ -18,260 +18,74 @@ import click
 @click.option('--blob_sigma', type=float, default=10.0)
 @click.option('--aug_hflip', is_flag=True, default=False)
 @click.option('--aug_rot_range', type=float, default=20.0)
-@click.option('--batch_size', type=int, default=5)
+@click.option('--batch_size', type=int, default=6)
 @click.option('--num_epochs', type=int, default=100)
 @click.option('--iters_per_epoch', type=int, default=1000)
 @click.option('--val_every_n_epochs', type=int, default=25)
 @click.option('--device', type=str, default='cuda:0')
 @click.option('--num_workers', type=int, default=8)
-def train_dextr(out_path, dataset, arch, learning_rate, load_model, pretrained_lr_factor, lr_sched, lr_poly_power,
+def train_dextr(job_name, dataset, arch, learning_rate, load_model, pretrained_lr_factor, lr_sched, lr_poly_power,
                 opt_type, sgd_weight_decay,
                 target_size, padding, extreme_range, noise_std, blob_sigma, aug_hflip, aug_rot_range,
                 batch_size, num_epochs, iters_per_epoch, val_every_n_epochs, device, num_workers):
     settings = locals().copy()
 
-    import math
-    import itertools
-    import time
-    import tqdm
-    import numpy as np
-    import torch, torch.nn as nn, torch.nn.functional as F
     import torch.utils.data
-    from torchvision.transforms import Compose
-    from dextr import lr_schedules, repeat_sampler
-    from dextr.data_pipeline import dextr_transforms
+    from dextr import model
     from dextr.data_pipeline import pascal_voc_dataset
     from dextr.architectures import deeplab, denseunet, resunet
+    import job_output
+
+    output = job_output.JobOutput(job_name, False)
+    output.connect_streams()
+
+    # Report setttings
+    print('Settings:')
+    print(', '.join(['{}={}'.format(key, settings[key]) for key in sorted(list(settings.keys()))]))
+
 
     torch_device = torch.device(device)
 
-    train_transform = Compose([
-        dextr_transforms.DextrTrainingTransform(
-            target_size_yx=(target_size, target_size),
-            padding=padding,
-            extreme_range=extreme_range,
-            noise_std=noise_std,
-            blob_sigma=blob_sigma,
-            hflip=aug_hflip,
-            rot_range=math.radians(aug_rot_range),
-            fix_box_to_extreme=True
-        ),
-        dextr_transforms.DextrToTensor(),
-        dextr_transforms.DextrNormalize(),
-    ])
-
-    eval_transform = Compose([
-        dextr_transforms.DextrFindExtremesTransform(
-            target_size_yx=(target_size, target_size),
-            extreme_range=extreme_range,
-        ),
-        dextr_transforms.DextrGaussBlobsTransform(
-            target_size_yx=(target_size, target_size),
-            padding=padding,
-            blob_sigma=blob_sigma,
-        ),
-        dextr_transforms.DextrToTensor(),
-        dextr_transforms.DextrNormalize(),
-    ])
-
     if dataset == 'pascal_voc':
-        train_ds = pascal_voc_dataset.PascalVOCDataset('train', train_transform)
-        val_ds = pascal_voc_dataset.PascalVOCDataset('val', eval_transform)
-        val_truth_ds = pascal_voc_dataset.PascalVOCDataset('val', None, load_input=False)
+        train_ds_fn = lambda transform=None: pascal_voc_dataset.PascalVOCDataset('train', transform)
+        val_ds_fn = lambda transform=None: pascal_voc_dataset.PascalVOCDataset('val', transform)
+        val_truth_ds_fn = lambda: pascal_voc_dataset.PascalVOCDataset('val', None, load_input=False)
     else:
         print('Unknown dataset {}'.format(dataset))
         return
 
     # Build network
     if arch == 'deeplab3':
-        net_dict = deeplab.dextr_deeplab3(1)
+        net = deeplab.dextr_deeplab3(1)
     elif arch == 'denseunet161':
-        net_dict = denseunet.dextr_denseunet161(1)
+        net = denseunet.dextr_denseunet161(1)
     elif arch == 'resunet50':
-        net_dict = resunet.dextr_resunet50(1)
+        net = resunet.dextr_resunet50(1)
     elif arch == 'resunet101':
-        net_dict = resunet.dextr_resunet101(1)
+        net = resunet.dextr_resunet101(1)
     else:
         print('Unknown network architecture {}'.format(arch))
         return
 
-    net = net_dict['model'].to(torch_device)
-
     # Load model if path provided
     if load_model is not None:
         print('Loading snapshot from {}...'.format(load_model))
-        snapshot = torch.load(load_model)
-        net.load_state_dict(snapshot['model_state'])
-        target_size = snapshot['target_size']
-        padding = snapshot['padding']
-        blob_sigma = snapshot['blob_sigma']
+        dextr_model = torch.load(load_model, map_location=torch_device)
         new_lr_factor = pretrained_lr_factor
     else:
+        dextr_model = model.DextrModel(net, (target_size, target_size), padding, blob_sigma)
         new_lr_factor = 1.0
 
-    # Create optimizer
-    if opt_type == 'sgd':
-        optimizer = torch.optim.SGD([
-            dict(params=net_dict['pretrained_parameters'], lr=learning_rate * pretrained_lr_factor),
-            dict(params=net_dict['new_parameters'], lr=learning_rate * new_lr_factor)],
-            momentum=0.9, nesterov=True, weight_decay=sgd_weight_decay, lr=learning_rate)
-    elif opt_type == 'adam':
-        optimizer = torch.optim.Adam([
-            dict(params=net_dict['pretrained_parameters'], lr=learning_rate * pretrained_lr_factor),
-            dict(params=net_dict['new_parameters'], lr=learning_rate * new_lr_factor)])
-    else:
-        print('Unknown optimizer type {}'.format(opt_type))
-        return
 
-    # LR schedule
-    if iters_per_epoch == -1:
-        iters_per_epoch = len(train_ds) // batch_size
-    total_iters = iters_per_epoch * num_epochs
+    def on_epoch_finished(epoch, model):
+        output.write_checkpoint(dextr_model)
 
-    lr_iter_scheduler = lr_schedules.make_lr_scheduler(
-        optimizer=optimizer, total_iters=total_iters, schedule_type=lr_sched,
-        poly_power=lr_poly_power
-    )
+    model.training_loop(dextr_model, train_ds_fn, val_ds_fn, val_truth_ds_fn, extreme_range,
+                        noise_std, learning_rate, pretrained_lr_factor, new_lr_factor,
+                        lr_sched, lr_poly_power, opt_type, sgd_weight_decay, aug_hflip, aug_rot_range,
+                        batch_size, iters_per_epoch, num_epochs, val_every_n_epochs,
+                        torch_device, num_workers, True, on_epoch_finished)
 
-
-    train_sampler = repeat_sampler.RepeatSampler(torch.utils.data.RandomSampler(train_ds))
-    train_loader = torch.utils.data.DataLoader(train_ds, batch_size, sampler=train_sampler,
-                                               num_workers=num_workers)
-
-    val_loader = torch.utils.data.DataLoader(val_ds, batch_size, num_workers=num_workers)
-
-
-    # Report setttings
-    print('Settings:')
-    print(', '.join(['{}={}'.format(key, settings[key]) for key in sorted(list(settings.keys()))]))
-
-    # Report dataset size
-    print('Dataset:')
-    print('len(train_ds)={}'.format(len(train_ds)))
-    print('len(val_ds)={}'.format(len(val_ds)))
-
-
-    train_iter = iter(train_loader)
-
-
-    def validate():
-        val_loss_accum = 0.0
-        val_iou_accum = 0.0
-        n_val_batches = 0
-        n_ious = 0
-        val_i = 0
-        with torch.no_grad():
-            for batch in tqdm.tqdm(val_loader, total=len(val_loader)):
-                input = batch['input'].to(torch_device)
-                target_mask = batch['target_mask'].to(torch_device)
-                crop_yx = batch['crop_yx'].detach().cpu().numpy()
-
-                # Compute class balance
-                target_mask_flat = target_mask.view(len(target_mask), -1)
-                target_balance = target_mask_flat.mean(dim=1)
-                target_balance = target_balance[:, None, None, None]
-                bg_weight = target_balance
-                fg_weight = 1.0 - target_balance
-                weight = bg_weight + (fg_weight - bg_weight) * target_mask
-
-                pred_out = net(input)
-                pred_logits = pred_out['out']
-
-                loss = F.binary_cross_entropy_with_logits(pred_logits, target_mask, weight=weight)
-                val_loss_accum += float(loss)
-
-                pred_prob = F.sigmoid(pred_logits).detach().cpu().numpy()
-
-                for i in range(len(crop_yx)):
-                    true_fg = np.array(val_truth_ds[val_i]['target_mask']) > 127
-                    pred_fg = dextr_transforms.paste_mask_into_image(
-                        true_fg.shape, pred_prob[i, 0, :, :], crop_yx[i]) >= 0.5
-
-                    iou_denom = (pred_fg | true_fg).sum()
-                    if iou_denom > 0.0:
-                        iou = (pred_fg & true_fg).sum() / iou_denom
-
-                        val_iou_accum += iou
-                        n_ious += 1
-
-                    val_i += 1
-
-
-                n_val_batches += 1
-
-        return (val_loss_accum / n_val_batches, val_iou_accum / n_ious)
-
-
-
-    print('Training...')
-    iter_i = 0
-    validated = False
-    for epoch in range(num_epochs):
-        t1 = time.time()
-
-        train_loss_accum = 0.0
-
-        for batch in tqdm.tqdm(itertools.islice(train_iter, iters_per_epoch), total=iters_per_epoch):
-            if lr_iter_scheduler is not None:
-                lr_iter_scheduler.step(iter_i)
-
-            input = batch['input'].to(torch_device)
-            target_mask = batch['target_mask'].to(torch_device)
-
-            optimizer.zero_grad()
-
-            # Compute class balance
-            target_mask_flat = target_mask.view(len(target_mask), -1)
-            target_balance = target_mask_flat.mean(dim=1)
-            target_balance = target_balance[:, None, None, None]
-            bg_weight = target_balance
-            fg_weight = 1.0 - target_balance
-            weight = bg_weight + (fg_weight - bg_weight) * target_mask
-
-            pred_out = net(input)
-            pred_logits = pred_out['out']
-
-            loss = F.binary_cross_entropy_with_logits(pred_logits, target_mask, weight=weight)
-
-            loss.backward()
-
-            optimizer.step()
-
-            train_loss_accum += float(loss)
-
-            iter_i += 1
-
-        train_loss_accum /= iters_per_epoch
-
-        if (epoch + 1) % val_every_n_epochs == 0:
-            val_loss, val_iou = validate()
-            validated = True
-        else:
-            val_loss = val_iou = None
-            validated = False
-
-        t2 = time.time()
-
-        if val_loss is not None:
-            print('Epoch {} took {:.3f}s: loss={:.6f}, VAL loss={:.6f}, mIoU={:.3%}'.format(
-                epoch + 1, t2 - t1, train_loss_accum, val_loss, val_iou))
-        else:
-            print('Epoch {} took {:.3f}s: loss={:.6f}'.format(epoch + 1, t2 - t1, train_loss_accum))
-
-
-        if out_path.strip() != 'none':
-            model_state = {key: value.to('cpu') for key, value in net.state_dict().items()}
-            snapshot = dict(
-                model_state=model_state,
-                target_size=target_size,
-                padding=padding,
-                blob_sigma=blob_sigma,
-            )
-            torch.save(snapshot, out_path)
-
-    if not validated:
-        val_loss, val_iou = validate()
-        print('FINAL: VAL loss={:.6f}, mIoU={:.3%}'.format(val_loss, val_iou))
 
 if __name__ == '__main__':
     train_dextr()

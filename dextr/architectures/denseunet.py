@@ -150,7 +150,10 @@ def dextr_denseunet161(num_classes=1):
     pretrained_ids = {id(p) for p in pretrained_parameters}
     new_parameters = [p for p in model.parameters() if id(p) not in pretrained_ids]
 
-    return dict(model=model, pretrained_parameters=pretrained_parameters, new_parameters=new_parameters)
+    model.pretrained_parameters = pretrained_parameters
+    model.new_parameters = new_parameters
+
+    return model
 
 
 

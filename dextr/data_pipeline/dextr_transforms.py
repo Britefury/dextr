@@ -153,7 +153,7 @@ class DextrTrainingTransform (object):
             # Create blobs
             gauss_y = _gaussian_kernels(self.target_size_yx[0], self.blob_sigma, final_points_yx[:, 0])
             gauss_x = _gaussian_kernels(self.target_size_yx[1], self.blob_sigma, final_points_yx[:, 1])
-            gauss_blobs = (gauss_y[:, :, None] * gauss_x[:, None, :]).max(axis=0)
+            heatmap = (gauss_y[:, :, None] * gauss_x[:, None, :]).max(axis=0)
 
             input_dextr_pil = sample['input'].transform(
                 self.target_size_yx[::-1], PIL.Image.AFFINE, tuple(dextr_xf_pil.flatten().tolist()),
@@ -162,7 +162,7 @@ class DextrTrainingTransform (object):
                 self.target_size_yx[::-1], PIL.Image.AFFINE, tuple(dextr_xf_pil.flatten().tolist()),
                 resample=PIL.Image.BILINEAR)
 
-            return dict(input=input_dextr_pil, target_mask=mask_dextr_pil, gauss_blobs=gauss_blobs)
+            return dict(input=input_dextr_pil, target_mask=mask_dextr_pil, heatmap=heatmap)
         else:
             # Scale to target size, accounting for padding
             scale = self.target_size_nopad_xy / outline_rotflip_xy_size.astype(float)
@@ -190,13 +190,13 @@ class DextrTrainingTransform (object):
             # Create blobs
             gauss_y = _gaussian_kernels(self.target_size_yx[0], self.blob_sigma, extreme_points[:, 0])
             gauss_x = _gaussian_kernels(self.target_size_yx[1], self.blob_sigma, extreme_points[:, 1])
-            gauss_blobs = (gauss_y[:, :, None] * gauss_x[:, None, :]).max(axis=0)
+            heatmap = (gauss_y[:, :, None] * gauss_x[:, None, :]).max(axis=0)
 
             input_dextr_pil = sample['input'].transform(
                 self.target_size_yx[::-1], PIL.Image.AFFINE, tuple(dextr_xf_pil.flatten().tolist()),
                 resample=PIL.Image.BILINEAR)
 
-            return dict(input=input_dextr_pil, target_mask=mask_dextr_pil, gauss_blobs=gauss_blobs)
+            return dict(input=input_dextr_pil, target_mask=mask_dextr_pil, heatmap=heatmap)
 
 
 class DextrFindExtremesTransform (object):
@@ -238,7 +238,66 @@ class DextrFindExtremesTransform (object):
                     target_mask_outline=sample['target_mask_outline'], extreme_points=extreme_points)
 
 
-class DextrGaussBlobsTransform (object):
+
+def crop_with_heatmap(input_image, target_mask, target_size_yx, padding, extreme_points, blob_sigma):
+    """
+    Crop the input image (and optionally target mask) to a region surrounding the extreme points
+    and create a corresponding heat map with gaussian blobs centred on the extreme points.
+
+    :param input_image: input image as a `PIL.Image`
+    :param target_mask: [optional] target mask as a `PIL.Image`
+    :param target_size_yx: target crop size
+    :param padding: padding in target crop space that lies between the extreme points and the closest
+        edge of the target crop
+    :param extreme_points: extreme points as a `(4, [y, x])` NumPy array
+    :param blob_sigma: Gaussian blob sigma size
+    :return: `(cropped_input, cropped_mask, heatmap, crop_yx)` where:
+        cropped_input is the crop taken from the input image, scaled to `target_size_yx`, as a PIL.Image
+        cropped_mask is the crop taken from the target mask image, scaled to `target_size_yx` as a PIL.Image,
+            or None if target_mask is None
+        heatmap is the heat map as a 2D NumPy array
+        crop_yx the crop region taken from the input and mask images as a `[[lower_y, lower_x], [upper_y, upper_x]]`
+            NumPy array
+    """
+    target_size_nopad_yx = np.array(target_size_yx) - padding * 2
+    rel_padding_yx = padding / target_size_nopad_yx
+
+    # Compute the bounding box given the points
+    points_lower_yx = extreme_points.min(axis=0)
+    points_upper_yx = extreme_points.max(axis=0)
+    points_size_yx = points_upper_yx - points_lower_yx
+    crop_lower_yx = points_lower_yx - points_size_yx * rel_padding_yx
+    crop_upper_yx = points_upper_yx + points_size_yx * rel_padding_yx
+    crop_size_yx = crop_upper_yx - crop_lower_yx
+
+    # Scale points so that their bounds fit the target size minus padding
+    points_frac_yx = (extreme_points - crop_lower_yx) / np.maximum(crop_size_yx, 1.0)
+    points_tgt_yx = points_frac_yx * np.array(target_size_yx)
+
+    # Create blobs
+    gauss_y = _gaussian_kernels(target_size_yx[0], blob_sigma, points_tgt_yx[:, 0])
+    gauss_x = _gaussian_kernels(target_size_yx[1], blob_sigma, points_tgt_yx[:, 1])
+    heatmap = (gauss_y[:, :, None] * gauss_x[:, None, :]).sum(axis=0)
+
+    input_dextr_pil = input_image.transform(
+        target_size_yx[::-1], method=PIL.Image.EXTENT,
+        data=(int(crop_lower_yx[1]), int(crop_lower_yx[0]), int(crop_upper_yx[1]), int(crop_upper_yx[0])),
+        resample=PIL.Image.BILINEAR)
+
+    crop_yx = np.stack([crop_lower_yx, crop_upper_yx], axis=0)
+
+    if target_mask is not None:
+        mask_dextr_pil = target_mask.transform(
+            target_size_yx[::-1], method=PIL.Image.EXTENT,
+            data=(crop_lower_yx[1], crop_lower_yx[0], crop_upper_yx[1], crop_upper_yx[0]),
+            resample=PIL.Image.BILINEAR)
+    else:
+        mask_dextr_pil = None
+
+    return input_dextr_pil, mask_dextr_pil, heatmap, crop_yx
+
+
+class DextrCropWithHeatmapTransform (object):
     def __init__(self, target_size_yx, padding, blob_sigma=10.0, keep_original_mask=False):
         self.padding = padding
         self.blob_sigma = blob_sigma
@@ -248,39 +307,14 @@ class DextrGaussBlobsTransform (object):
         self._rel_padding_yx = padding / self.target_size_nopad_yx
 
     def __call__(self, sample):
-        extreme_points = sample['extreme_points']
+        input_dextr_pil, mask_dextr_pil, heatmap, crop_yx = crop_with_heatmap(
+            sample['input'], sample.get('target_mask'), self.target_size_yx, self.padding,
+            sample['extreme_points'], self.blob_sigma
+        )
 
-        # Compute the bounding box given the points
-        points_lower_yx = extreme_points.min(axis=0)
-        points_upper_yx = extreme_points.max(axis=0)
-        points_size_yx = points_upper_yx - points_lower_yx
-        crop_lower_yx = points_lower_yx - points_size_yx * self._rel_padding_yx
-        crop_upper_yx = points_upper_yx + points_size_yx * self._rel_padding_yx
-        crop_size_yx = crop_upper_yx - crop_lower_yx
-
-        # Scale points so that their bounds fit the target size minus padding
-        points_frac_yx = (extreme_points - crop_lower_yx) / np.maximum(crop_size_yx, 1.0)
-        points_tgt_yx = points_frac_yx * np.array(self.target_size_yx)
-
-        # Create blobs
-        gauss_y = _gaussian_kernels(self.target_size_yx[0], self.blob_sigma, points_tgt_yx[:, 0])
-        gauss_x = _gaussian_kernels(self.target_size_yx[1], self.blob_sigma, points_tgt_yx[:, 1])
-        gauss_blobs = (gauss_y[:, :, None] * gauss_x[:, None, :]).sum(axis=0)
-
-        input_dextr_pil = sample['input'].transform(
-            self.target_size_yx[::-1], method=PIL.Image.EXTENT,
-            data=(int(crop_lower_yx[1]), int(crop_lower_yx[0]), int(crop_upper_yx[1]), int(crop_upper_yx[0])),
-            resample=PIL.Image.BILINEAR)
-
-        crop_yx = np.stack([crop_lower_yx, crop_upper_yx], axis=0)
-
-        out_sample = dict(input=input_dextr_pil, gauss_blobs=gauss_blobs, crop_yx=crop_yx)
+        out_sample = dict(input=input_dextr_pil, heatmap=heatmap, crop_yx=crop_yx)
 
         if 'target_mask' in sample:
-            mask_dextr_pil = sample['target_mask'].transform(
-                self.target_size_yx[::-1], method=PIL.Image.EXTENT,
-                data=(crop_lower_yx[1], crop_lower_yx[0], crop_upper_yx[1], crop_upper_yx[0]),
-                resample=PIL.Image.BILINEAR)
             out_sample['target_mask'] = mask_dextr_pil
         return out_sample
 
@@ -288,13 +322,13 @@ class DextrGaussBlobsTransform (object):
 class DextrToTensor (object):
     def __call__(self, sample):
         input_pil = sample['input']
-        gauss_blobs = sample['gauss_blobs']
+        heatmap = sample['heatmap']
 
         input_rgb = np.array(input_pil).astype(np.float32) / 255.0
-        input_rgbx = np.append(input_rgb, gauss_blobs[:, :, None], axis=2)
+        input_rgbh = np.append(input_rgb, heatmap[:, :, None], axis=2)
 
         out_sample = dict(
-            input=torch.tensor(input_rgbx.transpose(2, 0, 1), dtype=torch.float)
+            input=torch.tensor(input_rgbh.transpose(2, 0, 1), dtype=torch.float)
         )
 
         if 'target_mask' in sample:
@@ -311,7 +345,7 @@ class DextrToTensor (object):
 class DextrNormalize (object):
     """
     We need per-channel mean and standard devidation.
-    Channels are R, G, B, X where X is the gaussian blob channel.
+    Channels are R, G, B, H where H is the heat map channel.
 
     For RGB, use the ImageNet mean and std-dev specified in torchvision:
     mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
@@ -348,6 +382,13 @@ class DextrNormalize (object):
 
 
 def paste_mask_into_image(image_size, mask_arr, target_crop):
+    """
+
+    :param image_size: output image size as a `(H, W)` tuple
+    :param mask_arr: predicted mask as a `(target_h, target_w)` NumPy array
+    :param target_crop: image space box that mask should be pasted (with scaling) into
+    :return: PIL.Image of type 'L' (uint8, single channel) of size `image_size[::-1]`
+    """
     mask_size_yx = np.array(mask_arr.shape[:2])
 
     crop_lower_yx = target_crop[0]
@@ -368,26 +409,19 @@ def paste_mask_into_image(image_size, mask_arr, target_crop):
     if (output_size > 0).all():
         if issubclass(mask_arr.dtype.type, np.floating):
             mask_arr = (mask_arr * 255.0).astype(np.uint8)
-            is_float = True
-        else:
-            is_float = False
 
         mask_pil = PIL.Image.fromarray(mask_arr)
 
-        out_pil = mask_pil.transform(
+        crop_pil = mask_pil.transform(
             tuple(output_size)[::-1], method=PIL.Image.EXTENT,
             data=(src_mask_crop_lower_yx[1], src_mask_crop_lower_yx[0],
                   src_mask_crop_upper_yx[1], src_mask_crop_upper_yx[0]),
             resample=PIL.Image.BILINEAR)
 
-        out = np.array(out_pil)
-        out = np.pad(out, [[crop_lower_px_yx[0], image_size[0] - crop_upper_px_yx[0]],
-                           [crop_lower_px_yx[1], image_size[1] - crop_upper_px_yx[1]]], mode='constant')
+        out_pil = PIL.Image.new('L', image_size[::-1], 0)
+        out_pil.paste(crop_pil, (crop_lower_px_yx[1], crop_lower_px_yx[0]))
 
-        if is_float:
-            out = out.astype(np.float32) / 255.0
-
-        return out
+        return out_pil
     else:
-        return np.zeros(image_size, dtype=mask_arr.dtype)
+        return PIL.Image.new('L', image_size[::-1], 0)
 

@@ -24,5 +24,8 @@ def dextr_deeplab3(num_classes=1):
     new_param_ids = {id(p) for p in new_parameters}
     pretrained_parameters = [p for p in model.parameters() if id(p) not in new_param_ids]
 
-    return dict(model=model, pretrained_parameters=pretrained_parameters, new_parameters=new_parameters)
+    model.pretrained_parameters = pretrained_parameters
+    model.new_parameters = new_parameters
+
+    return model
 
