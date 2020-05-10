@@ -14,14 +14,15 @@ class DextrDataset (torch.utils.data.Dataset):
     IGNORE_INDEX = None
 
     def __init__(self, object_meta_path, transform, load_input=True):
-        if os.path.exists(object_meta_path):
+        if object_meta_path is not None and os.path.exists(object_meta_path):
             obj_meta = pickle.load(open(object_meta_path, 'rb'))
             self.obj_meta_indices = obj_meta['indices']
             self.obj_meta_outlines = obj_meta['outlines']
         else:
             self.obj_meta_indices, self.obj_meta_outlines = self._build_object_metadata()
-            obj_meta = dict(indices=self.obj_meta_indices, outlines=self.obj_meta_outlines)
-            pickle.dump(obj_meta, open(object_meta_path, 'wb'))
+            if object_meta_path is not None:
+                obj_meta = dict(indices=self.obj_meta_indices, outlines=self.obj_meta_outlines)
+                pickle.dump(obj_meta, open(object_meta_path, 'wb'))
 
         self.transform = transform
 
@@ -136,3 +137,96 @@ class DextrDataset (torch.utils.data.Dataset):
         m_y, m_x = np.where(outline)
         points = np.stack([m_y, m_x], axis=1)
         return points
+
+
+class LabelImageTargetDextrDataset (DextrDataset):
+    """
+    A dataset of input images and corresponding label images.
+
+    Each label image is an image with a 32-bit integer per pixel data type.
+    The value 0 indicates background while non-zero identifies pixels belonging
+    to the different objects in the image.
+    `np.array(label_image)` should return an integer array.
+    """
+    def __init__(self, input_paths, label_image_paths, transform=None, obj_meta_path=None,
+                 ignore_index=None, load_input=True):
+        """
+        Constructor
+
+        :param input_paths: list of paths for input images
+        :param label_image_paths: list of paths for label images, same length as `input_paths`
+        :param transform: [optional] transformation to apply
+        :param obj_meta_path: [optional] path for object cache file
+        :param ignore_index: [optional] index of label to ignore
+        :param load_input: if True, load input images, otherwise samples will not contain input images
+        """
+        self.input_paths = input_paths
+        self.label_image_paths = label_image_paths
+        self.IGNORE_INDEX = ignore_index
+
+        super(LabelImageTargetDextrDataset, self).__init__(obj_meta_path, transform, load_input=load_input)
+
+    @property
+    def num_images(self):
+        return len(self.input_paths)
+
+    def get_input_image_pil(self, img_i):
+        path = self.input_paths[img_i]
+        img = Image.open(path)
+        img.load()
+        return img
+
+    def get_instance_y_arr(self, sample_i):
+        path = self.label_image_paths[sample_i]
+        img = Image.open(path)
+        img.load()
+        return np.array(img)
+
+
+class MaskStackTargetDextrDataset (DextrDataset):
+    """
+    A dataset of input images and corresponding mask image stacks.
+
+    Each mask stack is a list of binary images, one image per object. Most likely single channel uint8 type
+    (PIL type 'L').
+    """
+
+    def __init__(self, input_paths, mask_stack_paths, transform, obj_meta_path=None,
+                 ignore_index=None, load_input=True):
+        """
+        Constructor
+
+        :param input_paths: list of paths for input images
+        :param mask_stack_paths: nested list of paths for mask images: the input image at `input_paths[i]`
+            should have a corresponding list of masks `mask_stack_paths[i]`, that lists the paths to the
+            mask images, one mask per object. All the masks should have the same size as the corresponding
+            input image.
+        :param transform: [optional] transformation to apply
+        :param obj_meta_path: [optional] path for object cache file
+        :param ignore_index: [optional] index of label to ignore
+        :param load_input: if True, load input images, otherwise samples will not contain input images
+        """
+        self.input_paths = input_paths
+        self.mask_stack_paths = mask_stack_paths
+        self.IGNORE_INDEX = ignore_index
+
+        super(MaskStackTargetDextrDataset, self).__init__(obj_meta_path, transform, load_input=load_input)
+
+    @property
+    def num_images(self):
+        return len(self.input_paths)
+
+    def get_input_image_pil(self, img_i):
+        path = self.input_paths[img_i]
+        img = Image.open(path)
+        img.load()
+        return img
+
+    def get_instance_y_arr(self, sample_i):
+        mask_paths = self.mask_stack_paths[sample_i]
+        masks = []
+        for p in mask_paths:
+            img = Image.open(p)
+            img.load()
+            masks.append(np.array(img))
+        return np.stack(masks, axis=0)
