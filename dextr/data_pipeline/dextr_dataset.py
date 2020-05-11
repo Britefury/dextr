@@ -1,8 +1,32 @@
+# The MIT License (MIT)
+#
+# Copyright (c) 2020 University of East Anglia, Norwich, UK
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+#
+# Developed by Geoffrey French in collaboration with Dr. M. Fisher and
+# Dr. M. Mackiewicz.
+
 """
 Pascal VOC dataset
 """
 import os, pickle
-import tqdm
 import numpy as np
 from scipy.ndimage.morphology import binary_erosion
 from scipy.ndimage import label
@@ -13,13 +37,13 @@ import torch.utils.data
 class DextrDataset (torch.utils.data.Dataset):
     IGNORE_INDEX = None
 
-    def __init__(self, object_meta_path, transform, load_input=True):
+    def __init__(self, object_meta_path, transform, load_input=True, progress_fn=None):
         if object_meta_path is not None and os.path.exists(object_meta_path):
             obj_meta = pickle.load(open(object_meta_path, 'rb'))
             self.obj_meta_indices = obj_meta['indices']
             self.obj_meta_outlines = obj_meta['outlines']
         else:
-            self.obj_meta_indices, self.obj_meta_outlines = self._build_object_metadata()
+            self.obj_meta_indices, self.obj_meta_outlines = self._build_object_metadata(progress_fn)
             if object_meta_path is not None:
                 obj_meta = dict(indices=self.obj_meta_indices, outlines=self.obj_meta_outlines)
                 pickle.dump(obj_meta, open(object_meta_path, 'wb'))
@@ -69,11 +93,14 @@ class DextrDataset (torch.utils.data.Dataset):
         else:
             return None
 
-    def _build_object_metadata(self):
+    def _build_object_metadata(self, progress_fn=None):
         obj_meta_indices = []
         obj_meta_outlines = []
 
-        for img_i in tqdm.tqdm(range(self.num_images), desc='Building object list'):
+        if progress_fn is None:
+            progress_fn = lambda x: x
+
+        for img_i in progress_fn(range(self.num_images)):
             inst_y = self.get_instance_y_arr(img_i)
             num_labels = self.get_num_labels_in_inst_y(inst_y)
 
@@ -149,7 +176,7 @@ class LabelImageTargetDextrDataset (DextrDataset):
     `np.array(label_image)` should return an integer array.
     """
     def __init__(self, input_paths, label_image_paths, transform=None, obj_meta_path=None,
-                 ignore_index=None, load_input=True):
+                 ignore_index=None, load_input=True, progress_fn=None):
         """
         Constructor
 
@@ -164,7 +191,8 @@ class LabelImageTargetDextrDataset (DextrDataset):
         self.label_image_paths = label_image_paths
         self.IGNORE_INDEX = ignore_index
 
-        super(LabelImageTargetDextrDataset, self).__init__(obj_meta_path, transform, load_input=load_input)
+        super(LabelImageTargetDextrDataset, self).__init__(obj_meta_path, transform, load_input=load_input,
+                                                           progress_fn=progress_fn)
 
     @property
     def num_images(self):
@@ -191,8 +219,8 @@ class MaskStackTargetDextrDataset (DextrDataset):
     (PIL type 'L').
     """
 
-    def __init__(self, input_paths, mask_stack_paths, transform, obj_meta_path=None,
-                 ignore_index=None, load_input=True):
+    def __init__(self, input_paths, mask_stack_paths, transform=None, obj_meta_path=None,
+                 ignore_index=None, load_input=True, progress_fn=None):
         """
         Constructor
 
@@ -210,7 +238,8 @@ class MaskStackTargetDextrDataset (DextrDataset):
         self.mask_stack_paths = mask_stack_paths
         self.IGNORE_INDEX = ignore_index
 
-        super(MaskStackTargetDextrDataset, self).__init__(obj_meta_path, transform, load_input=load_input)
+        super(MaskStackTargetDextrDataset, self).__init__(obj_meta_path, transform, load_input=load_input,
+                                                          progress_fn=progress_fn)
 
     @property
     def num_images(self):

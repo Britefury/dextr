@@ -1,15 +1,43 @@
+# The MIT License (MIT)
+#
+# Copyright (c) 2020 University of East Anglia, Norwich, UK
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+#
+# Developed by Geoffrey French in collaboration with Dr. M. Fisher and
+# Dr. M. Mackiewicz.
+
 import time
 import math
 import itertools
 import numpy as np
+from skimage.util import img_as_ubyte, img_as_float32
+import PIL.Image
 import torch, torch.nn.functional as F
 import torch.utils.data
 from torchvision.transforms import Compose
+from torch.hub import load_state_dict_from_url
 from dextr.data_pipeline import dextr_transforms
 from dextr import lr_schedules, repeat_sampler
 
 
-class DextrInferenceDataset (torch.utils.data.Dataset):
+class _DextrInferenceDataset (torch.utils.data.Dataset):
     def __init__(self, images, object_extreme_points, transform=None):
         if len(images) != len(object_extreme_points):
             raise ValueError('The number of images ({}) and the number of extreme point sets ({}) do not match'.format(
@@ -23,14 +51,28 @@ class DextrInferenceDataset (torch.utils.data.Dataset):
         return len(self.images)
 
     def __getitem__(self, item):
-        sample = dict(input=self.images[item], extreme_points=self.object_extreme_points[item])
+        image = self.images[item]
+        if isinstance(image, np.ndarray):
+            image = img_as_ubyte(image)
+            image = PIL.Image.fromarray(image)
+        sample = dict(input=image, extreme_points=self.object_extreme_points[item])
         if self.transform is not None:
             sample = self.transform(sample)
         return sample
 
 
 class DextrModel (object):
+    URL_PASCALVOC_RESUNET101 = 'https://storage.googleapis.com/dextr_pytorch_models_public/dextr_pascalvoc_resunet101-a2d81727.pth'
+
     def __init__(self, net, target_size_yx, padding, blob_sigma):
+        """
+        Constructor
+
+        :param net: the DEXTR network; a PyTorch Module instance
+        :param target_size_yx: the size to which crops are scaled for inference
+        :param padding: amount of space between edges of crop and the closest extreme points
+        :param blob_sigma: the sigma of the Gaussian blobs placed at each extreme point
+        """
         self.net = net
         self.target_size_yx = target_size_yx
         self.padding = padding
@@ -50,11 +92,14 @@ class DextrModel (object):
         """
         Predict DEXTR masks for objects identified in images by extreme points.
 
-        :param images: a list of N PIL Images
+        :param images: a list of N images; images can be PIL Images or NumPy arrays
         :param object_extreme_points: extreme points for each object/image as an array of `(N, 4, [y,x])` NumPy arrays
-        :return: mask for each image in images
+        :param torch_device: PyTorch device used
+        :param batch_size: batch size used (relevant when using a large number of images)
+        :param num_workers: number of background processes used by the data pipeline
+        :return: mask for each image in images, where each mask is a NumPy array
         """
-        ds = DextrInferenceDataset(images, object_extreme_points, transform=self.__inference_transforms)
+        ds = _DextrInferenceDataset(images, object_extreme_points, transform=self.__inference_transforms)
         loader = torch.utils.data.DataLoader(ds, batch_size=batch_size, num_workers=num_workers)
         sample_i = 0
         predictions = []
@@ -65,35 +110,88 @@ class DextrModel (object):
 
                 pred_logits = self.net(input)['out']
 
-                pred_prob = F.sigmoid(pred_logits).detach().cpu().numpy()
+                pred_prob = torch.sigmoid(pred_logits).detach().cpu().numpy()
 
                 for i in range(len(crop_yx)):
                     image_size = images[sample_i].size[::-1]
                     pred_pil = dextr_transforms.paste_mask_into_image(
                         image_size, pred_prob[i, 0, :, :], crop_yx[i])
 
-                    predictions.append(pred_pil)
+                    pred_pil_arr = img_as_float32(np.array(pred_pil))
+
+                    predictions.append(pred_pil_arr)
 
                     sample_i += 1
 
         return predictions
 
     def train(self):
-        self.net.train()
+        """Switch to training mode.
+        """
+        self.net = self.net.train()
 
     def eval(self):
-        self.net.eval()
+        """Switch to evaluation mode.
+        """
+        self.net = self.net.eval()
 
     def to(self, device):
+        """Move network to specified device.
+        """
         self.net = self.net.to(device)
         return self
+
+    @staticmethod
+    def pascalvoc_resunet101(map_location=None):
+        return load_state_dict_from_url(DextrModel.URL_PASCALVOC_RESUNET101,
+                                        map_location=map_location, check_hash=True)
 
 
 def training_loop(model, train_ds_fn, val_ds_fn, val_truth_ds_fn, extreme_range, noise_std,
                   learning_rate, pretrained_lr_factor, new_lr_factor,
                   lr_sched, lr_poly_power, opt_type, sgd_weight_decay, aug_hflip, aug_rot_range,
                   batch_size, iters_per_epoch, num_epochs, val_every_n_epochs,
-                  torch_device, num_workers, verbose, on_epoch_finished):
+                  torch_device, num_workers, verbose, on_epoch_finished=None):
+    """Train a DEXTR model.
+
+    :param model: the model to train as a `DextrModel` instance
+    :param train_ds_fn: function that returns the training set, of the form `fn(transform=None)`. Returns an
+        instance of a subclass of `torch.utils.data.Dataset`. The `transform` parameter would normally be passed to
+        the dataset constructor.
+    :param val_ds_fn: function that returns the validation set, see `train_ds_fn`
+    :param val_truth_ds_fn: function that returns the validation set, without transforms, where each sample only needs
+        to contain the target object mask image
+    :param extreme_range: when the object mask is scaled to match the size of the target crop used for
+        training/inference, extreme points will be selected from mask pixels that are within this range
+        of the edge (5 pixels is most likely a good choice)
+    :param noise_std: standard deviation of Gaussian noise added to extreme point positions during training
+        (1.0 would be a good choice)
+    :param learning_rate: learning rate used during training (0.1 works well for SGD)
+    :param pretrained_lr_factor: learning rate scaling factor used for fine-tuning pre-trained parameters (0.1)
+    :param new_lr_factor: learning rate scaling factor used for training new parameters. Use 1.0 if starting
+        from an ImageNet pre-trained classifier with new output layers. If starting from a trained DEXTR
+        network use 0.1.
+    :param lr_sched: learning rate schedule type 'none' for constant schedule, 'cosine' for a cosine schedule
+        that uses a cosine wave to scale the learning rate to 0 over the course of training, or 'poly' for
+        a polynomial schedule, or a callable/function of the from `fn(optimizer, T_max)` where `T_max` is
+        the total number of iterations
+    :param lr_poly_power: when `lr_sched == 'poly'` this value determines the power; the learning rate used is
+        `learning_rate * (1 - current_iter / total_iters) ** lr_poly_power`
+    :param opt_type: optimizer type 'sgd', 'adam' or a callable of the form `fn(param_groups)`
+    :param sgd_weight_decay: the weight decay value used when using an SGD optimizer
+    :param aug_hflip: if True, use random horizontal flip augmentation
+    :param aug_rot_range: rotation range in degrees, e.g. a value of 20 will rotate samples
+        between -20 and 20 degrees
+    :param batch_size: the batch size for training
+    :param iters_per_epoch: the number of iterations per epoch
+    :param num_epochs: the number of epochs to train for
+    :param val_every_n_epochs: the number of epochs between each validation
+    :param torch_device: the torch device used for training
+    :param num_workers: the number of worker processes used to build data batches
+    :param verbose: if True, print progress using `print` function
+    :param on_epoch_finished: [optional] callback invoked after finishing each epoch
+    :return:
+    """
     train_transform = Compose([
         dextr_transforms.DextrTrainingTransform(
             target_size_yx=model.target_size_yx,
@@ -125,8 +223,12 @@ def training_loop(model, train_ds_fn, val_ds_fn, val_truth_ds_fn, extreme_range,
 
     # Build dataset
     train_ds = train_ds_fn(transform=train_transform)
-    val_ds = val_ds_fn(transform=eval_transform)
-    val_truth_ds = val_truth_ds_fn()
+    if val_ds_fn is not None and val_truth_ds_fn is not None:
+        val_ds = val_ds_fn(transform=eval_transform)
+        val_truth_ds = val_truth_ds_fn()
+    else:
+        val_ds = None
+        val_truth_ds = None
 
     model = model.to(torch_device)
 
@@ -163,7 +265,10 @@ def training_loop(model, train_ds_fn, val_ds_fn, val_truth_ds_fn, extreme_range,
     train_loader = torch.utils.data.DataLoader(train_ds, batch_size, sampler=train_sampler,
                                                num_workers=num_workers)
 
-    val_loader = torch.utils.data.DataLoader(val_ds, batch_size, num_workers=num_workers)
+    if val_ds is not None:
+        val_loader = torch.utils.data.DataLoader(val_ds, batch_size, num_workers=num_workers)
+    else:
+        val_loader = None
 
 
     train_iter = iter(train_loader)
@@ -172,7 +277,8 @@ def training_loop(model, train_ds_fn, val_ds_fn, val_truth_ds_fn, extreme_range,
         # Report dataset size
         print('Dataset:')
         print('len(train_ds)={}'.format(len(train_ds)))
-        print('len(val_ds)={}'.format(len(val_ds)))
+        if val_ds is not None:
+            print('len(val_ds)={}'.format(len(val_ds)))
 
     def validate():
         val_loss_accum = 0.0
@@ -201,7 +307,7 @@ def training_loop(model, train_ds_fn, val_ds_fn, val_truth_ds_fn, extreme_range,
                 loss = F.binary_cross_entropy_with_logits(pred_logits, target_mask, weight=weight)
                 val_loss_accum += float(loss)
 
-                pred_prob = F.sigmoid(pred_logits).detach().cpu().numpy()
+                pred_prob = torch.sigmoid(pred_logits).detach().cpu().numpy()
 
                 for i in range(len(crop_yx)):
                     true_mask = np.array(val_truth_ds[val_i]['target_mask']) > 127
@@ -269,7 +375,7 @@ def training_loop(model, train_ds_fn, val_ds_fn, val_truth_ds_fn, extreme_range,
         train_loss_accum /= iters_per_epoch
 
         if verbose:
-            if (epoch + 1) % val_every_n_epochs == 0:
+            if val_ds is not None and (epoch + 1) % val_every_n_epochs == 0:
                 val_loss, val_iou = validate()
                 validated = True
             else:
@@ -289,6 +395,6 @@ def training_loop(model, train_ds_fn, val_ds_fn, val_truth_ds_fn, extreme_range,
             on_epoch_finished(epoch, model)
 
     if verbose:
-        if not validated:
+        if not validated and val_ds is not None:
             val_loss, val_iou = validate()
             print('FINAL: VAL loss={:.6f}, mIoU={:.3%}'.format(val_loss, val_iou))
