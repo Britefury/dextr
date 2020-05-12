@@ -142,7 +142,7 @@ class DextrModel (object):
         return self
 
     @staticmethod
-    def pascalvoc_resunet101(map_location=None):
+    def pascalvoc_resunet101(map_location='cpu'):
         return load_state_dict_from_url(DextrModel.URL_PASCALVOC_RESUNET101,
                                         map_location=map_location, check_hash=True)
 

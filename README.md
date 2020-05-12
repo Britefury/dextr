@@ -5,6 +5,49 @@ The original implementation can be found at [https://github.com/scaelles/DEXTR-P
 
 This implementation is intended for use as a library.
 
+### Installation
+
+`> pip install dextr`
+
+
+## Python Inference API
+
+See `demo.py` for an example of using the `dextr` inference API.
+
+We have trained a ResNet-101 based U-Net DEXTR model on the Pascal VOC 2012 training set. You can download it
+[here](https://storage.googleapis.com/dextr_pytorch_models_public/dextr_pascalvoc_resunet101-a2d81727.pth).
+
+You can load this model -- downloading it automatically -- like so:
+
+```py3
+from dextr.model import DextrModel
+
+# Load the model (automatically downloads if necessary)
+# You can also provide a `map_location` paramter to load it onto a specific device
+model = DextrModel.pascalvoc_resunet101()
+```
+
+Alternatively you can load a model that you have trained yourself from a file:
+```py3
+MODEL_PATH = '...'
+dextr_model = torch.load(MODEL_PATH, map_location='cuda:0')
+```
+
+Use the `predict` method to predict a mask for an object in an image, identified by its extreme points:
+
+```py3
+mask = dextr_model.predict([image], [extreme_points], torch_device)[0]
+```
+
+You can perform inference on multiple images with one call.
+The `DextrModel.predict` method takes a list
+of images and extreme points as either a list of `(4, [y, x])` NumPy arrays or
+one `(N, 4, [y, x])` shaped NumPy array. 
+
+The images that you use as input can take the form of either NumPy arrays or PIL Images. Each image should
+have a corresponding list of four extreme points. It returns a list of masks; each
+mask is the same size as the corresponding input image:
+
 
 ## Training using the command line `train_dextr.py` program
 
@@ -41,16 +84,18 @@ to the label/mask image file names. E.g. the image `img0.jpg` will match the lab
 For mask stack datasets `img0.jpg` would match to the mask images `img0_mask0.png`, ... `img0_maskN.png`.
 The images and labels can live in separate directories; they are matched by filename *only*.
 
+In these examples, we assume that you have downloaded the pre-trained DEXTR model linked above.
+
 ##### Training using a label image data set
 
 `> python train_dextr.py my_model_from_labels --dataset=custom_label
 --train_image_pat=/mydataset/train/input/*.jpg --train_target_pat=/mydataset/train/labels/*.png
---arch=resunet101 --load_model=checkpoints/pascal_resunet101.pth`
+--arch=resunet101 --load_model=dextr_pascalvoc_resunet101-a2d81727.pth`
 
 The input and label images are given to the `--train_image_pat` and `--train_target_pat` options.
 You can specify validation images using the `--val_image_pat` and `--val_target_pat` options in a similar way.
 
-`--load_model=checkpoints/pascal_resunet101.pth` indicates that we should start by loading the
+`--load_model=dextr_pascalvoc_resunet101-a2d81727.pth` indicates that we should start by loading the
 model trained on Pascal VOC above and fine-tune it, rather than starting from an ImageNet classifier.
 
 You can specify that the label index 255 should be ignore by adding `--label_ignore_index=255`.
@@ -65,32 +110,8 @@ You could train using the entire (train and validation) Pascal VOC data set usin
 
 `> python train_dextr.py my_model_from_masks --dataset=custom_mask
 --train_image_pat=/mydataset/train/input/*.jpg --train_target_pat=/mydataset/train/masks/*.png
---arch=resunet101 --load_model=checkpoints/pascal_resunet101.pth`
+--arch=resunet101 --load_model=dextr_pascalvoc_resunet101-a2d81727.pth`
 
-
-
-## Python Inference API
-
-First, load the model using `torch.load`:
-
-```py3
-# Load model and switch to evaluation mode
-MODEL_PATH = 'checkpoints/pascalvoc_resunet101.pth'
-torch_device = torch.device('cuda:0')
-dextr_model = torch.load(MODEL_PATH, map_location=torch_device)
-dextr_model.eval()
-```
-
-The images that you use as input can take the form of either NumPy arrays or PIL Images. Each image should
-have a corresponding list of four extreme points. The `DextrModel` class `predict` method takes a list
-of `N` images and a `(N, 4, [y, x])` shaped NumPy array of extreme points. It returns a list of masks; each
-mask is the same size as the corresponding input image:
-
-```py3
-masks = dextr_model.predict(images, extreme_points, torch_device)
-```
-
-See `demo.py` for an example of using the `dextr` inference API.
 
 
 ## Python training API
