@@ -46,6 +46,12 @@ class _DextrInferenceDataset (torch.utils.data.Dataset):
         self.images = images
         self.object_extreme_points = object_extreme_points
         self.transform = transform
+        self.image_sizes = []
+        for img_i, image in enumerate(images):
+            if isinstance(image, np.ndarray):
+                self.image_sizes.append(image.shape[:2])
+            else:
+                self.image_sizes.append(image.size[::-1])
 
     def __len__(self):
         return len(self.images)
@@ -88,7 +94,7 @@ class DextrModel (object):
             dextr_transforms.DextrNormalize(),
         ])
 
-    def predict(self, images, object_extreme_points, torch_device, batch_size=4, num_workers=0):
+    def predict(self, images, object_extreme_points, torch_device=None, batch_size=4, num_workers=0):
         """
         Predict DEXTR masks for objects identified in images by extreme points.
 
@@ -99,6 +105,8 @@ class DextrModel (object):
         :param num_workers: number of background processes used by the data pipeline
         :return: mask for each image in images, where each mask is a NumPy array
         """
+        if torch_device is None:
+            torch_device = next(self.net.parameters()).device
         ds = _DextrInferenceDataset(images, object_extreme_points, transform=self.__inference_transforms)
         loader = torch.utils.data.DataLoader(ds, batch_size=batch_size, num_workers=num_workers)
         sample_i = 0
@@ -113,7 +121,7 @@ class DextrModel (object):
                 pred_prob = torch.sigmoid(pred_logits).detach().cpu().numpy()
 
                 for i in range(len(crop_yx)):
-                    image_size = images[sample_i].size[::-1]
+                    image_size = ds.image_sizes[sample_i]
                     pred_pil = dextr_transforms.paste_mask_into_image(
                         image_size, pred_prob[i, 0, :, :], crop_yx[i])
 

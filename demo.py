@@ -53,7 +53,7 @@ def demo(image_path, model_path, device):
             break
 
         # Predict masks (points come from matplotlib in [x,y] order; this must be flipped)
-        masks = dextr_model.predict([image], extreme_points[None, :, ::-1], torch_device)
+        masks = dextr_model.predict([image], extreme_points[None, :, ::-1])
 
         mask_bin = masks[0] >= 0.5
         edges = sobel(mask_bin.astype(float)) != 0

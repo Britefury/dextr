@@ -36,7 +36,7 @@ dextr_model = torch.load(MODEL_PATH, map_location='cuda:0')
 Use the `predict` method to predict a mask for an object in an image, identified by its extreme points:
 
 ```py3
-mask = dextr_model.predict([image], [extreme_points], torch_device)[0]
+mask = dextr_model.predict([image], [extreme_points])[0]
 ```
 
 You can perform inference on multiple images with one call.
