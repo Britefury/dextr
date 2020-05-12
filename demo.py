@@ -1,16 +1,17 @@
 import click
 
 @click.command()
-@click.argument('model_path', type=click.Path(readable=True))
 @click.option('--image_path', type=click.Path(readable=True))
+@click.option('--model_path', type=click.Path(readable=True))
 @click.option('--device', type=str)
-def demo(model_path, image_path, device):
+def demo(image_path, model_path, device):
     import os
     import numpy as np
     from matplotlib import pyplot as plt
     from scipy.ndimage import sobel
     from PIL import Image
     import torch
+    from dextr.model import DextrModel
 
     if device is None:
         if torch.cuda.is_available():
@@ -21,7 +22,13 @@ def demo(model_path, image_path, device):
     torch_device = torch.device(device)
 
     # Load model
-    dextr_model = torch.load(model_path, map_location=torch_device)
+    if model_path is not None:
+        # A model path was provided; load it
+        dextr_model = torch.load(model_path, map_location=torch_device)
+    else:
+        # No model path; download (if necessary) and load a pre-trained model
+        dextr_model = DextrModel.pascalvoc_resunet101().to(torch_device)
+
     dextr_model.eval()
 
     # Load image
